@@ -1,0 +1,686 @@
+#!/usr/bin/env node
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+const VERSION = '0.1.0';
+const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+const SLIDE_ID_RE = /^[a-z0-9_-]+$/i;
+const DEFAULT_ICONS = ['🤖', '🧮', '🏢', '💻', '📊', '🔬', '🚀', '📚', '🎯', '⚡'];
+
+function configPath() {
+  if (process.env.OPENSLIDE_HUB_CONFIG) {
+    return path.resolve(process.env.OPENSLIDE_HUB_CONFIG);
+  }
+  const xdg = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+  return path.join(xdg, 'openslide-hub', 'config.json');
+}
+
+function loadConfig() {
+  const file = configPath();
+  if (!fs.existsSync(file)) {
+    return { hubDir: null, sources: [], managedFolderIds: [] };
+  }
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return {
+      hubDir: typeof raw.hubDir === 'string' ? raw.hubDir : null,
+      sources: Array.isArray(raw.sources) ? raw.sources : [],
+      managedFolderIds: Array.isArray(raw.managedFolderIds) ? raw.managedFolderIds : [],
+    };
+  } catch (err) {
+    die(`Failed to parse config at ${file}: ${err.message}`);
+  }
+}
+
+function saveConfig(cfg) {
+  const file = configPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
+}
+
+function die(msg, code = 1) {
+  process.stderr.write(`openslide-hub: ${msg}\n`);
+  process.exit(code);
+}
+
+function folderIdFor(dir) {
+  const hash = createHash('sha256').update(path.resolve(dir)).digest('hex').slice(0, 8);
+  return `f-${hash}`;
+}
+
+function parseIcon(raw, index = 0) {
+  if (!raw) {
+    return { type: 'emoji', value: DEFAULT_ICONS[index % DEFAULT_ICONS.length] };
+  }
+  if (typeof raw === 'object' && (raw.type === 'emoji' || raw.type === 'color')) {
+    return raw;
+  }
+  const str = String(raw).trim();
+  if (COLOR_RE.test(str)) {
+    return { type: 'color', value: str };
+  }
+  return { type: 'emoji', value: str.slice(0, 8) || '📁' };
+}
+
+function slugify(str) {
+  return (
+    String(str)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'src'
+  );
+}
+
+function inferSourceName(absDir) {
+  const base = path.basename(absDir);
+  if (base === 'slides' || base === 'slide') {
+    const parent = path.basename(path.dirname(absDir));
+    if (parent && parent !== 'workspace') return parent;
+  }
+  return base;
+}
+
+function isOpenSlideWorkspace(dir) {
+  const pkgPath = path.join(dir, 'package.json');
+  if (!fs.existsSync(pkgPath)) return false;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+    if (deps['@open-slide/core'] && !pkg.workspaces) {
+      return fs.existsSync(path.join(dir, 'slides')) || fs.existsSync(path.join(dir, 'open-slide.config.ts'));
+    }
+  } catch {}
+  return false;
+}
+
+function readInstalledCoreVersion(dir) {
+  const p = path.join(dir, 'node_modules', '@open-slide', 'core', 'package.json');
+  if (!fs.existsSync(p)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf8')).version ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function readDeclaredCoreVersion(dir) {
+  const p = path.join(dir, 'package.json');
+  if (!fs.existsSync(p)) return null;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return pkg.dependencies?.['@open-slide/core'] ?? pkg.devDependencies?.['@open-slide/core'] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function hasV1ViteLeftover(dir) {
+  const p = path.join(dir, 'package.json');
+  if (!fs.existsSync(p)) return false;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return Boolean(pkg.dependencies?.vite || pkg.devDependencies?.vite);
+  } catch {
+    return false;
+  }
+}
+
+function detectPackageManager(dir) {
+  let curr = path.resolve(dir);
+  while (true) {
+    if (fs.existsSync(path.join(curr, 'pnpm-lock.yaml'))) return 'pnpm';
+    if (fs.existsSync(path.join(curr, 'yarn.lock'))) return 'yarn';
+    if (fs.existsSync(path.join(curr, 'bun.lockb')) || fs.existsSync(path.join(curr, 'bun.lock'))) return 'bun';
+    if (fs.existsSync(path.join(curr, 'package-lock.json'))) return 'npm';
+    const parent = path.dirname(curr);
+    if (parent === curr) return 'npm';
+    curr = parent;
+  }
+}
+
+function countDecksIn(dir) {
+  const sDir = path.join(dir, 'slides');
+  if (!fs.existsSync(sDir)) return 0;
+  let count = 0;
+  for (const entry of fs.readdirSync(sDir)) {
+    if (entry === 'getting-started' || entry.startsWith('.')) continue;
+    const p = path.join(sDir, entry);
+    try {
+      if (fs.statSync(p).isDirectory() && SLIDE_ID_RE.test(entry)) count++;
+    } catch {}
+  }
+  return count;
+}
+
+function cmdInit(args) {
+  let dir = process.cwd();
+  let force = false;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--force') force = true;
+    else if (!args[i].startsWith('-')) dir = path.resolve(args[i]);
+    else die(`Unknown option: ${args[i]}`, 2);
+  }
+  if (!fs.existsSync(dir)) die(`Directory does not exist: ${dir}`);
+  if (!force && !isOpenSlideWorkspace(dir)) {
+    die(`${dir} does not look like an open-slide project (missing @open-slide/core in package.json). Use --force to override.`);
+  }
+  const cfg = loadConfig();
+  cfg.hubDir = dir;
+  saveConfig(cfg);
+  console.log(`Initialized hub at ${dir}`);
+}
+
+function cmdAdd(args) {
+  let targetDir = null;
+  let name = null;
+  let icon = null;
+  let noSync = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--name' || a === '-n') {
+      name = args[++i];
+      if (!name) die('--name requires a value', 2);
+    } else if (a === '--icon' || a === '-i') {
+      icon = args[++i];
+      if (!icon) die('--icon requires a value', 2);
+    } else if (a === '--no-sync') {
+      noSync = true;
+    } else if (!a.startsWith('-')) {
+      targetDir = path.resolve(a);
+    } else {
+      die(`Unknown option: ${a}`, 2);
+    }
+  }
+
+  if (!targetDir) die('Usage: openslide-hub add <dir> [--name <label>] [--icon <emoji|#hex>]', 2);
+  if (!fs.existsSync(targetDir)) die(`Directory does not exist: ${targetDir}`);
+  // Allow passing the parent repo if `<repo>/slides` is the actual open-slide workspace
+  if (!isOpenSlideWorkspace(targetDir) && isOpenSlideWorkspace(path.join(targetDir, 'slides'))) {
+    targetDir = path.join(targetDir, 'slides');
+  }
+  if (!fs.existsSync(path.join(targetDir, 'slides'))) {
+    die(`No slides/ directory found inside ${targetDir}`);
+  }
+
+  const cfg = loadConfig();
+  if (cfg.hubDir && path.resolve(cfg.hubDir) === targetDir) {
+    die(`Cannot add the hub directory itself (${targetDir}) as a source`);
+  }
+
+  const id = folderIdFor(targetDir);
+  const existingIdx = cfg.sources.findIndex((s) => path.resolve(s.dir) === targetDir);
+  const resolvedName = (name || (existingIdx >= 0 ? cfg.sources[existingIdx].name : inferSourceName(targetDir))).slice(0, 40);
+  const resolvedIcon = parseIcon(
+    icon ?? (existingIdx >= 0 ? cfg.sources[existingIdx].icon : null),
+    existingIdx >= 0 ? existingIdx : cfg.sources.length,
+  );
+
+  const entry = { id, name: resolvedName, icon: resolvedIcon, dir: targetDir };
+  if (existingIdx >= 0) {
+    cfg.sources[existingIdx] = entry;
+    console.log(`Updated source "${resolvedName}" (${targetDir})`);
+  } else {
+    cfg.sources.push(entry);
+    console.log(`Added source "${resolvedName}" (${targetDir})`);
+  }
+  saveConfig(cfg);
+
+  if (!noSync && cfg.hubDir) {
+    syncHub(cfg);
+  }
+}
+
+function cmdRm(args) {
+  const query = args.find((a) => !a.startsWith('-'));
+  if (!query) die('Usage: openslide-hub rm <name-or-dir>', 2);
+
+  const cfg = loadConfig();
+  const absQuery = path.resolve(query);
+  const before = cfg.sources.length;
+  cfg.sources = cfg.sources.filter(
+    (s) => s.name !== query && s.id !== query && path.resolve(s.dir) !== absQuery,
+  );
+  if (cfg.sources.length === before) {
+    die(`No registered source matching "${query}"`);
+  }
+  saveConfig(cfg);
+  console.log(`Removed source "${query}"`);
+  if (cfg.hubDir) {
+    syncHub(cfg);
+  }
+}
+
+function scanWorkspaces(rootDir, maxDepth = 4) {
+  const found = [];
+  const skip = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.herdr', '.agents', '.claude']);
+
+  function walk(curr, depth) {
+    if (depth > maxDepth) return;
+    if (isOpenSlideWorkspace(curr)) {
+      found.push(curr);
+      return;
+    }
+    let entries;
+    try {
+      entries = fs.readdirSync(curr, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (!e.isDirectory() || e.name.startsWith('.') || skip.has(e.name)) continue;
+      walk(path.join(curr, e.name), depth + 1);
+    }
+  }
+
+  walk(path.resolve(rootDir), 0);
+  return found.sort();
+}
+
+function cmdScan(args) {
+  let root = process.cwd();
+  let apply = false;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--add') apply = true;
+    else if (!args[i].startsWith('-')) root = path.resolve(args[i]);
+    else die(`Unknown option: ${args[i]}`, 2);
+  }
+
+  const cfg = loadConfig();
+  const hubAbs = cfg.hubDir ? path.resolve(cfg.hubDir) : null;
+  const workspaces = scanWorkspaces(root).filter((d) => d !== hubAbs);
+
+  if (workspaces.length === 0) {
+    console.log(`No open-slide workspaces found under ${root}`);
+    return;
+  }
+
+  for (const w of workspaces) {
+    const decks = countDecksIn(w);
+    const ver = readInstalledCoreVersion(w) || readDeclaredCoreVersion(w) || '?';
+    console.log(`  ${inferSourceName(w).padEnd(20)} ${String(`${decks} deck(s)`).padEnd(12)} v${String(ver).padEnd(8)} ${w}`);
+    if (apply) {
+      const existingIdx = cfg.sources.findIndex((s) => path.resolve(s.dir) === w);
+      if (existingIdx < 0) {
+        cfg.sources.push({
+          id: folderIdFor(w),
+          name: inferSourceName(w).slice(0, 40),
+          icon: parseIcon(null, cfg.sources.length),
+          dir: w,
+        });
+      }
+    }
+  }
+
+  if (apply) {
+    saveConfig(cfg);
+    console.log(`\nRegistered ${cfg.sources.length} source(s).`);
+    if (cfg.hubDir) syncHub(cfg);
+  } else {
+    console.log(`\nRun "openslide-hub scan ${root} --add" to register these workspaces.`);
+  }
+}
+
+function syncHub(cfg = loadConfig()) {
+  if (!cfg.hubDir) {
+    die('No hub initialized. Run: openslide-hub init <hub-dir>');
+  }
+  const hubRoot = path.resolve(cfg.hubDir);
+  const slidesDir = path.join(hubRoot, 'slides');
+  const assetsDir = path.join(hubRoot, 'assets');
+  const themesDir = path.join(hubRoot, 'themes');
+
+  for (const d of [slidesDir, assetsDir, themesDir]) {
+    fs.mkdirSync(d, { recursive: true });
+    for (const entry of fs.readdirSync(d)) {
+      const p = path.join(d, entry);
+      if (fs.lstatSync(p).isSymbolicLink()) {
+        fs.unlinkSync(p);
+      }
+    }
+  }
+
+  // Read existing .folders.json so user-created folders and local (non-symlink) deck assignments stay intact
+  const manifestFile = path.join(slidesDir, '.folders.json');
+  let existingFolders = [];
+  let existingAssignments = {};
+  if (fs.existsSync(manifestFile)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+      if (Array.isArray(parsed.folders)) existingFolders = parsed.folders;
+      if (parsed.assignments && typeof parsed.assignments === 'object') existingAssignments = parsed.assignments;
+    } catch {}
+  }
+
+  const prevManagedIds = new Set([
+    ...(cfg.managedFolderIds || []),
+    ...cfg.sources.map((s) => s.id),
+  ]);
+
+  const userFolders = existingFolders.filter((f) => f && f.id && !prevManagedIds.has(f.id));
+  const preservedAssignments = {};
+  for (const [deckId, folderId] of Object.entries(existingAssignments)) {
+    if (prevManagedIds.has(folderId)) continue;
+    const deckPath = path.join(slidesDir, deckId);
+    if (fs.existsSync(deckPath) && !fs.lstatSync(deckPath).isSymbolicLink()) {
+      preservedAssignments[deckId] = folderId;
+    }
+  }
+
+  const managedFolders = [];
+  const managedAssignments = {};
+  const usedIds = new Set(
+    fs.readdirSync(slidesDir).map((n) => n.toLowerCase()),
+  );
+
+  let collisions = 0;
+  for (const src of cfg.sources) {
+    if (!fs.existsSync(src.dir)) continue;
+    managedFolders.push({ id: src.id, name: src.name, icon: src.icon });
+
+    const sDir = path.join(src.dir, 'slides');
+    if (fs.existsSync(sDir)) {
+      const entries = fs.readdirSync(sDir).sort();
+      for (const deck of entries) {
+        if (deck === 'getting-started' || deck.startsWith('.')) continue;
+        if (!SLIDE_ID_RE.test(deck)) continue;
+        const target = path.join(sDir, deck);
+        try {
+          if (!fs.statSync(target).isDirectory()) continue;
+        } catch {
+          continue;
+        }
+
+        let linkName = deck;
+        if (usedIds.has(linkName.toLowerCase())) {
+          collisions++;
+          const prefix = slugify(src.name);
+          linkName = `${prefix}--${deck}`;
+          let suffix = 2;
+          while (usedIds.has(linkName.toLowerCase())) {
+            linkName = `${prefix}-${suffix}--${deck}`;
+            suffix++;
+          }
+        }
+
+        usedIds.add(linkName.toLowerCase());
+        const linkPath = path.join(slidesDir, linkName);
+        fs.symlinkSync(target, linkPath, 'dir');
+        managedAssignments[linkName] = src.id;
+      }
+    }
+
+    for (const [sub, destDir] of [
+      ['assets', assetsDir],
+      ['themes', themesDir],
+    ]) {
+      const subDir = path.join(src.dir, sub);
+      if (!fs.existsSync(subDir)) continue;
+      for (const item of fs.readdirSync(subDir).sort()) {
+        if (item.startsWith('.')) continue;
+        const target = path.join(subDir, item);
+        const linkPath = path.join(destDir, item);
+        if (!fs.existsSync(linkPath)) {
+          fs.symlinkSync(target, linkPath);
+        }
+      }
+    }
+  }
+
+  const nextManifest = {
+    folders: [...managedFolders, ...userFolders],
+    assignments: { ...preservedAssignments, ...managedAssignments },
+  };
+  fs.writeFileSync(manifestFile, `${JSON.stringify(nextManifest, null, 2)}\n`, 'utf8');
+
+  cfg.managedFolderIds = managedFolders.map((f) => f.id);
+  saveConfig(cfg);
+
+  const deckCount = Object.keys(managedAssignments).length;
+  const colNote = collisions > 0 ? ` (${collisions} renamed to avoid id collision)` : '';
+  console.log(`Synced ${deckCount} deck(s) across ${managedFolders.length} folder(s) into ${hubRoot}${colNote}`);
+}
+
+function cmdList(args) {
+  const json = args.includes('--json');
+  const cfg = loadConfig();
+  const rows = cfg.sources.map((s) => ({
+    id: s.id,
+    name: s.name,
+    icon: s.icon?.value ?? '',
+    dir: s.dir,
+    exists: fs.existsSync(s.dir),
+    decks: fs.existsSync(s.dir) ? countDecksIn(s.dir) : 0,
+    version: fs.existsSync(s.dir) ? readInstalledCoreVersion(s.dir) : null,
+  }));
+
+  if (json) {
+    console.log(JSON.stringify({ hubDir: cfg.hubDir, sources: rows }, null, 2));
+    return;
+  }
+
+  console.log(`Hub: ${cfg.hubDir ?? '(not initialized)'}`);
+  if (rows.length === 0) {
+    console.log('No sources registered. Use "openslide-hub add <dir>" or "openslide-hub scan <root> --add".');
+    return;
+  }
+  console.log('');
+  console.log(`${'NAME'.padEnd(20)} ${'DECKS'.padEnd(8)} ${'VERSION'.padEnd(10)} DIRECTORY`);
+  for (const r of rows) {
+    const label = `${r.icon ? `${r.icon} ` : ''}${r.name}`;
+    const ver = r.version ? `v${r.version}` : r.exists ? 'uninstalled' : 'missing';
+    console.log(`${label.padEnd(20)} ${String(r.decks).padEnd(8)} ${ver.padEnd(10)} ${r.dir}`);
+  }
+}
+
+function fixV1PackageJson(dir) {
+  const pkgPath = path.join(dir, 'package.json');
+  if (!fs.existsSync(pkgPath)) return false;
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  let changed = false;
+
+  for (const sec of ['dependencies', 'devDependencies']) {
+    if (pkg[sec]?.vite) {
+      delete pkg[sec].vite;
+      changed = true;
+    }
+  }
+  for (const r of ['react', 'react-dom']) {
+    const v = pkg.dependencies?.[r] || pkg.devDependencies?.[r];
+    if (v && /^\^?18\./.test(v)) {
+      pkg.dependencies = pkg.dependencies || {};
+      pkg.dependencies[r] = '^19.3.1';
+      if (pkg.devDependencies?.[r]) delete pkg.devDependencies[r];
+      changed = true;
+    }
+  }
+  for (const t of ['@types/react', '@types/react-dom']) {
+    const v = pkg.devDependencies?.[t] || pkg.dependencies?.[t];
+    if (v && /^\^?18\./.test(v)) {
+      pkg.devDependencies = pkg.devDependencies || {};
+      pkg.devDependencies[t] = '^19.2.0';
+      if (pkg.dependencies?.[t]) delete pkg.dependencies[t];
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+    fs.rmSync(path.join(dir, 'node_modules'), { recursive: true, force: true });
+    fs.rmSync(path.join(dir, 'package-lock.json'), { force: true });
+  }
+  return changed;
+}
+
+function cmdUpdateAll() {
+  const cfg = loadConfig();
+  const dirs = [
+    ...(cfg.hubDir ? [cfg.hubDir] : []),
+    ...cfg.sources.map((s) => s.dir),
+  ].filter((d, idx, arr) => d && fs.existsSync(d) && arr.indexOf(d) === idx);
+
+  if (dirs.length === 0) die('No hub or sources configured to update.');
+
+  for (const d of dirs) {
+    console.log(`\n=== Updating ${d} ===`);
+    if (fixV1PackageJson(d)) {
+      console.log('  migrated v1 package.json remnants (removed vite, bumped react to ^19)');
+    }
+    const pm = detectPackageManager(d);
+    const args =
+      pm === 'npm'
+        ? ['install', '@open-slide/core@latest', '--no-audit', '--no-fund']
+        : ['add', '@open-slide/core@latest'];
+    const res = spawnSync(pm, args, { cwd: d, stdio: 'inherit' });
+    if (res.status !== 0) {
+      die(`Failed to update @open-slide/core in ${d}`);
+    }
+    const bin = path.join(d, 'node_modules', '.bin', 'open-slide');
+    if (fs.existsSync(bin)) {
+      spawnSync(bin, ['sync:skills'], { cwd: d, stdio: 'inherit' });
+    }
+  }
+
+  if (cfg.hubDir) {
+    console.log('');
+    syncHub(cfg);
+  }
+}
+
+function cmdDoctor() {
+  const cfg = loadConfig();
+  let problems = 0;
+  const ok = (m) => console.log(`  ok    ${m}`);
+  const warn = (m) => console.log(`  note  ${m}`);
+  const bad = (m) => {
+    console.log(`  FAIL  ${m}`);
+    problems++;
+  };
+
+  console.log(`openslide-hub ${VERSION}`);
+  console.log(`config: ${configPath()}`);
+
+  console.log('hub:');
+  if (!cfg.hubDir) {
+    bad('hubDir not configured (run: openslide-hub init <hub-dir>)');
+  } else if (!fs.existsSync(cfg.hubDir)) {
+    bad(`hubDir does not exist: ${cfg.hubDir}`);
+  } else {
+    const ver = readInstalledCoreVersion(cfg.hubDir);
+    if (ver) ok(`${cfg.hubDir} (@open-slide/core v${ver})`);
+    else bad(`${cfg.hubDir} is missing node_modules/@open-slide/core`);
+    if (hasV1ViteLeftover(cfg.hubDir)) {
+      bad(`${cfg.hubDir}/package.json lists legacy "vite" dependency (run: openslide-hub update-all)`);
+    }
+  }
+
+  console.log('sources:');
+  if (cfg.sources.length === 0) {
+    warn('no sources registered');
+  }
+  const versions = new Set();
+  for (const s of cfg.sources) {
+    if (!fs.existsSync(s.dir)) {
+      bad(`${s.name}: directory missing (${s.dir})`);
+      continue;
+    }
+    const ver = readInstalledCoreVersion(s.dir);
+    if (ver) versions.add(ver);
+    const decks = countDecksIn(s.dir);
+    if (hasV1ViteLeftover(s.dir)) {
+      bad(`${s.name}: package.json lists legacy "vite" dependency (${s.dir})`);
+    } else if (!ver) {
+      warn(`${s.name}: @open-slide/core not installed in node_modules (${decks} deck(s), ${s.dir})`);
+    } else {
+      ok(`${s.name}: ${decks} deck(s), @open-slide/core v${ver} (${s.dir})`);
+    }
+  }
+
+  if (versions.size > 1) {
+    warn(`version drift across sources (${Array.from(versions).join(', ')}); run "openslide-hub update-all"`);
+  }
+
+  if (problems === 0) {
+    console.log('doctor: ok');
+  } else {
+    console.log(`doctor: ${problems} problem(s)`);
+    process.exit(1);
+  }
+}
+
+function cmdDev(args) {
+  const cfg = loadConfig();
+  syncHub(cfg);
+  const bin = path.join(cfg.hubDir, 'node_modules', '.bin', 'open-slide');
+  if (!fs.existsSync(bin)) {
+    die(`open-slide binary not found at ${bin}. Run "npm install" inside ${cfg.hubDir}.`);
+  }
+  const res = spawnSync(bin, ['dev', ...args], { cwd: cfg.hubDir, stdio: 'inherit' });
+  process.exit(res.status ?? 0);
+}
+
+function printHelp() {
+  console.log(`openslide-hub — aggregate multiple open-slide repos into one categorized hub
+
+Usage:
+  openslide-hub init [hub-dir]                      Set the hub workspace directory
+  openslide-hub add <dir> [--name N] [--icon E]     Register a source repo and sync
+  openslide-hub rm <name-or-dir>                    Remove a source repo and re-sync
+  openslide-hub scan [root-dir] [--add]             Discover open-slide workspaces under root-dir
+  openslide-hub list [--json]                       List registered sources and deck counts
+  openslide-hub sync                                Sync deck/asset/theme symlinks and .folders.json
+  openslide-hub dev [open-slide-dev-args...]        Sync and start open-slide dev in the hub
+  openslide-hub update-all                          Upgrade @open-slide/core + sync:skills everywhere
+  openslide-hub doctor                              Check hub, sources, and version consistency
+
+Environment:
+  OPENSLIDE_HUB_CONFIG   Override config path (default: ~/.config/openslide-hub/config.json)`);
+}
+
+const [cmd = 'help', ...rest] = process.argv.slice(2);
+switch (cmd) {
+  case 'init':
+    cmdInit(rest);
+    break;
+  case 'add':
+    cmdAdd(rest);
+    break;
+  case 'rm':
+  case 'remove':
+    cmdRm(rest);
+    break;
+  case 'scan':
+    cmdScan(rest);
+    break;
+  case 'list':
+  case 'ls':
+    cmdList(rest);
+    break;
+  case 'sync':
+    syncHub();
+    break;
+  case 'dev':
+    cmdDev(rest);
+    break;
+  case 'update-all':
+    cmdUpdateAll();
+    break;
+  case 'doctor':
+    cmdDoctor();
+    break;
+  case '--version':
+  case '-v':
+  case 'version':
+    console.log(`openslide-hub ${VERSION}`);
+    break;
+  case '--help':
+  case '-h':
+  case 'help':
+    printHelp();
+    break;
+  default:
+    die(`Unknown command "${cmd}". Run "openslide-hub --help" for usage.`, 2);
+}

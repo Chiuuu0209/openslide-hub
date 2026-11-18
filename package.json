@@ -1,0 +1,26 @@
+{
+  "name": "openslide-hub",
+  "version": "0.1.0",
+  "description": "Aggregate multiple open-slide repositories into a single categorized hub and keep them updated in sync.",
+  "type": "module",
+  "bin": {
+    "openslide-hub": "./bin/openslide-hub"
+  },
+  "files": [
+    "bin",
+    "skill"
+  ],
+  "scripts": {
+    "test": "bash tests/smoke.sh"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "open-slide",
+    "slides",
+    "ai-agents",
+    "cli"
+  ],
+  "license": "MIT"
+}
