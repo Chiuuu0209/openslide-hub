@@ -359,8 +359,11 @@ function syncHub(cfg = loadConfig()) {
     ...(cfg.managedFolderIds || []),
     ...cfg.sources.map((s) => s.id),
   ]);
+  const managedNames = new Set(cfg.sources.map((s) => s.name.toLowerCase()));
 
-  const userFolders = existingFolders.filter((f) => f && f.id && !prevManagedIds.has(f.id));
+  const userFolders = existingFolders.filter(
+    (f) => f && f.id && !prevManagedIds.has(f.id) && !managedNames.has(String(f.name || '').toLowerCase()),
+  );
   const preservedAssignments = {};
   for (const [deckId, folderId] of Object.entries(existingAssignments)) {
     if (prevManagedIds.has(folderId)) continue;
